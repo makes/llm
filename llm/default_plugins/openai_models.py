@@ -425,6 +425,13 @@ class OptionsForReasoning(SharedOptions):
         ),
         default=None,
     )
+    ollama_think: Optional[bool] = Field(
+        description=(
+            "If true, the model will think step-by-step before answering. "
+            "This is only supported for reasoning models."
+        ),
+        default=None,
+    )
 
 
 def _attachment(attachment):
@@ -493,7 +500,7 @@ class _Shared:
 
         if reasoning:
             self.Options = OptionsForReasoning
-
+        
         if vision:
             self.attachment_types.update(
                 {
@@ -630,6 +637,12 @@ class _Shared:
 
     def build_kwargs(self, prompt, stream):
         kwargs = dict(not_nulls(prompt.options))
+        is_ollama_native = self.api_base and self.api_base.endswith("/api")
+        if not is_ollama_native:
+            # pop and ignore all kwargs that start with 'ollama_'
+            for key in list(kwargs):
+                if key.startswith("ollama_"):
+                    kwargs.pop(key)
         json_object = kwargs.pop("json_object", None)
         if "max_tokens" not in kwargs and self.default_max_tokens is not None:
             kwargs["max_tokens"] = self.default_max_tokens
@@ -656,6 +669,154 @@ class _Shared:
             kwargs["stream_options"] = {"include_usage": True}
         return kwargs
 
+    # The methods _create_completion_sync and _create_completion_async
+    # are used to handle the Ollama API streaming behavior in
+    # order to use Ollama-specific options like 'think'.
+    def _create_completion_sync(self, client, messages, kwargs, stream=False):
+        # This is the synchronous version for the Chat class
+        ollama_options = {
+            key[7:]: kwargs.pop(key)
+            for key in list(kwargs)
+            if key.startswith("ollama_")
+        }
+        is_ollama_native = self.api_base and self.api_base.endswith("/api")
+        if is_ollama_native:
+            if not stream:
+                raise NotImplementedError(
+                    "Non-streaming with custom Ollama options is not implemented."
+                )
+
+            def ollama_sync_stream_generator():
+                payload = {
+                    "model": self.model_name or self.model_id,
+                    "messages": messages,
+                    "stream": True,
+                }
+                kwargs.pop("stream_options", None)
+                payload.update(kwargs)
+                payload.update(ollama_options)
+
+                with client._client.stream(
+                    "POST", "/chat", json=payload
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            # Translate Ollama's native format to OpenAI's format
+                            openai_chunk = {
+                                "id": f"ollama-{data.get('created_at')}",
+                                "object": "chat.completion.chunk",
+                                "created": int(
+                                    datetime.datetime.fromisoformat(
+                                        data["created_at"].replace("Z", "+00:00")
+                                    ).timestamp()
+                                ),
+                                "model": data["model"],
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": data.get("message", {}).get(
+                                                "content", ""
+                                            )
+                                        },
+                                        "finish_reason": "stop"
+                                        if data.get("done")
+                                        else None,
+                                    }
+                                ],
+                            }
+                            yield openai.types.chat.chat_completion_chunk.ChatCompletionChunk.model_validate(
+                                openai_chunk
+                            )
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            return ollama_sync_stream_generator()
+        else:
+            # Standard path
+            return client.chat.completions.create(
+                model=self.model_name or self.model_id,
+                messages=messages,
+                stream=stream,
+                **kwargs,
+            )
+
+    async def _create_completion_async(self, client, messages, kwargs, stream=False):
+        # This is the asynchronous version for the AsyncChat class
+        ollama_options = {
+            key[7:]: kwargs.pop(key)
+            for key in list(kwargs)
+            if key.startswith("ollama_")
+        }
+        is_ollama_native = self.api_base and self.api_base.endswith("/api")
+        print("is_ollama_native", is_ollama_native)
+        if is_ollama_native:
+            if not stream:
+                raise NotImplementedError(
+                    "Non-streaming with custom Ollama options is not implemented."
+                )
+
+            async def ollama_async_stream_generator():
+                payload = {
+                    "model": self.model_name or self.model_id,
+                    "messages": messages,
+                    "stream": True,
+                }
+                kwargs.pop("stream_options", None)
+                payload.update(kwargs)
+                payload.update(ollama_options)
+
+                async with client._client.stream(
+                    "POST", "/chat", json=payload
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            # Translate Ollama's native format to OpenAI's format
+                            openai_chunk = {
+                                "id": f"ollama-{data.get('created_at')}",
+                                "object": "chat.completion.chunk",
+                                "created": int(
+                                    datetime.datetime.fromisoformat(
+                                        data["created_at"].replace("Z", "+00:00")
+                                    ).timestamp()
+                                ),
+                                "model": data["model"],
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "content": data.get("message", {}).get(
+                                                "content", ""
+                                            )
+                                        },
+                                        "finish_reason": "stop"
+                                        if data.get("done")
+                                        else None,
+                                    }
+                                ],
+                            }
+                            yield openai.types.chat.chat_completion_chunk.ChatCompletionChunk.model_validate(
+                                openai_chunk
+                            )
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            return ollama_async_stream_generator()
+        else:
+            # Standard path
+            return await client.chat.completions.create(
+                model=self.model_name or self.model_id,
+                messages=messages,
+                stream=stream,
+                **kwargs,
+            )
+
 
 class Chat(_Shared, KeyModel):
     needs_key = "openai"
@@ -676,11 +837,8 @@ class Chat(_Shared, KeyModel):
         client = self.get_client(key)
         usage = None
         if stream:
-            completion = client.chat.completions.create(
-                model=self.model_name or self.model_id,
-                messages=messages,
-                stream=True,
-                **kwargs,
+            completion = self._create_completion_sync(
+                client, messages, kwargs, stream=True
             )
             chunks = []
             tool_calls = {}
@@ -715,11 +873,8 @@ class Chat(_Shared, KeyModel):
                         )
                     )
         else:
-            completion = client.chat.completions.create(
-                model=self.model_name or self.model_id,
-                messages=messages,
-                stream=False,
-                **kwargs,
+            completion = self._create_completion_sync(
+                client, messages, kwargs, stream=False
             )
             usage = completion.usage.model_dump()
             response.response_json = remove_dict_none_values(completion.model_dump())
@@ -758,11 +913,8 @@ class AsyncChat(_Shared, AsyncKeyModel):
         client = self.get_client(key, async_=True)
         usage = None
         if stream:
-            completion = await client.chat.completions.create(
-                model=self.model_name or self.model_id,
-                messages=messages,
-                stream=True,
-                **kwargs,
+            completion = await self._create_completion_async(
+                client, messages, kwargs, stream=True
             )
             chunks = []
             tool_calls = {}
@@ -799,11 +951,14 @@ class AsyncChat(_Shared, AsyncKeyModel):
                     )
             response.response_json = remove_dict_none_values(combine_chunks(chunks))
         else:
-            completion = await client.chat.completions.create(
-                model=self.model_name or self.model_id,
-                messages=messages,
-                stream=False,
-                **kwargs,
+            # completion = await client.chat.completions.create(
+            #     model=self.model_name or self.model_id,
+            #     messages=messages,
+            #     stream=False,
+            #     **kwargs,
+            # )
+            completion = await self._create_completion_async(
+                client, messages, kwargs, stream=False
             )
             response.response_json = remove_dict_none_values(completion.model_dump())
             usage = completion.usage.model_dump()
